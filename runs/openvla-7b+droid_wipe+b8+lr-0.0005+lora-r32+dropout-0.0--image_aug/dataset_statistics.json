@@ -1,0 +1,8 @@
+{
+  "custom_pickle_dataset": {
+    "action": {
+      "q01": 0,
+      "q99": 1
+    }
+  }
+}

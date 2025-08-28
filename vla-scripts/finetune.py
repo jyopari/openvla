@@ -95,6 +95,9 @@ class FinetuneConfig:
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
 
+    # Custom Dataset (non-RLDS) Path
+    custom_dataset_dir: Optional[Path] = None                       # If set, use CustomPickleDataset at this path
+
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
@@ -104,7 +107,7 @@ class FinetuneConfig:
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+    #wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
     # fmt: on
@@ -162,7 +165,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
         vla = prepare_model_for_kbit_training(vla)
@@ -197,29 +199,46 @@ def finetune(cfg: FinetuneConfig) -> None:
     #       your own Dataset, make sure to add the appropriate logic to the training loop!
     #
     # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
+    # Prefer a custom pickle dataset if provided; otherwise fall back to dummy.
+    from custom_pickle_dataset import CustomPickleDataset  # type: ignore
+
+    custom_dir = str(cfg.custom_dataset_dir) if cfg.custom_dataset_dir is not None else None
+
+    if custom_dir is not None and len(custom_dir) > 0:
+        print(f"Using CustomPickleDataset from: {custom_dir}")
+        vla_dataset = CustomPickleDataset(
+            root_dir=custom_dir,
+            action_tokenizer=action_tokenizer,
+            base_tokenizer=processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        )
+    else:
+        from prismatic.vla.datasets import DummyDataset
+
+        vla_dataset = DummyDataset(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        )
+    # ---
+    # batch_transform = RLDSBatchTransform(
     #     action_tokenizer,
     #     processor.tokenizer,
     #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+    #     prompt_builder_fn=Pimport numpy as np
+
+
     # )
-    # ---
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    )
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
+    # vla_dataset = RLDSDataset(
+    #     cfg.data_root_dir,
+    #     cfg.dataset_name,
+    #     batch_transform,
+    #     resize_resolution=tuple(vla.module.config.image_sizes),
+    #     shuffle_buffer_size=cfg.shuffle_buffer_size,
+    #     image_aug=cfg.image_aug,
+    # )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
@@ -239,7 +258,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize Logging =>> W&B
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+        wandb.init(project=cfg.wandb_project, name=f"ft+{exp_id}")
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
@@ -252,12 +271,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
+                # DEBUG 
+                pixel_values = torch.load('/data/pulkitag/models/jyop/code/openvla/vla-scripts/pixels.pth')
+                pixel_values = pixel_values.repeat(8, 1, 1, 1)
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
-                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                    #pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                    pixel_values=pixel_values.to(torch.bfloat16).to(device_id),
                     labels=batch["labels"],
                 )
+                import ipdb; ipdb.set_trace()
                 loss = output.loss
 
             # Normalize loss to account for gradient accumulation
